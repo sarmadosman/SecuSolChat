@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest tests/ -q)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import ast,sys; [ast.parse\\(open\\(f\\).read\\(\\), f\\) for f in ['app.py','chatbot/controller.py','security_client/api_client.py']]; print\\('syntax ok'\\)\")",
+      "Bash(timeout 25 python3 -m streamlit run app.py --server.headless true --server.port 8599)",
+      "Bash(curl -s -o /dev/null -w \"streamlit HTTP %{http_code}\\\\n\" http://localhost:8599)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"streamlit run app.py\")",
+      "Bash(python3)",
+      "Bash(python3 -m pytest)",
+      "Bash(python3 -m pytest -q)",
+      "Bash(python3 scripts/ask.py --dry-run \"Which cameras are offline?\")",
+      "Bash(python3 scripts/ask.py \"Are there any critical alarms?\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(timeout 25 python3 -m streamlit run app.py --server.headless true --server.port 8601)",
+      "Bash(curl -s -o /dev/null -w \"streamlit HTTP %{http_code}\\\\n\" http://localhost:8601)"
+    ]
+  }
+}
