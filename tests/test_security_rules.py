@@ -52,9 +52,22 @@ class TestSanitization:
         with pytest.raises(ValueError):
             sanitize_records([{"secret": "x"}], "not_a_kind")
 
-    def test_every_action_has_an_allowlist(self) -> None:
-        assert set(RECORD_KIND) == set(ACTIONS)
+    def test_every_record_returning_action_has_an_allowlist(self) -> None:
+        # summarize_records returns counts, not records, so it has no allowlist.
+        record_actions = set(ACTIONS) - {"summarize_records"}
+        assert set(RECORD_KIND) == record_actions
         assert set(RECORD_KIND.values()) <= set(ALLOWLISTS)
+
+    def test_summaries_carry_no_record_bodies(self) -> None:
+        """Aggregation must not become a side channel around sanitization."""
+        from security_client.mock_client import MockSecurityClient
+
+        summary = MockSecurityClient().summarize_records(
+            record_type="events", group_by="type", limit=50
+        )
+        payload = summary.to_tool_payload()
+        assert "records" not in payload
+        assert set(payload["groups"][0]) == {"key", "count"}
 
 
 class TestResultCaps:
@@ -90,6 +103,18 @@ class TestExecutionPath:
             client, "get_active_alarms", {"severity": "critical", "callback_url": "http://evil"}
         )
         assert outcome.is_error
+
+    def test_unknown_device_is_reported_not_substituted(self, client) -> None:
+        outcome = execute_tool_request(client, "get_device_status", {"device": "Server 99"})
+        assert outcome.is_error
+        assert "No device matches" in outcome.payload["error"]
+        assert "records" not in outcome.payload
+
+    def test_ambiguous_device_returns_candidates_rather_than_picking(self, client) -> None:
+        outcome = execute_tool_request(client, "get_device_status", {"device": "pc"})
+        assert outcome.is_error
+        assert len(outcome.payload["candidates"]) > 1
+        assert set(outcome.payload["candidates"][0]) == {"id", "name"}
 
     def test_successful_call_returns_sanitized_records(self, client) -> None:
         outcome = execute_tool_request(

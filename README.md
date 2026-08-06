@@ -9,23 +9,59 @@ for what is left to do.
 
 ## Status
 
+526 tests pass with no API key.
+
 | Layer | State |
 |---|---|
 | Schemas, allowlist, sanitization, caps | done, tested |
 | Mock client + synthetic dataset | done, tested |
+| SQL backend (SQLite / PostgreSQL / MySQL) | done, tested — parity with the mock |
 | Tool-use controller | done, tested against a stubbed model |
-| Streamlit UI | done, needs a live API key to exercise |
+| Streamlit UI | done; runs offline, needs a key for the real model |
 | Real API adapter | **written against an assumed contract — unverified** |
-| Evaluation set | seed of 34 cases; target 50+ |
+| Evaluation set | 67 cases from MTC's samples; live run pending |
+| **The live model path** | **never exercised — no request has been sent** |
 
 ## Setup
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 cp .env.example .env          # add ANTHROPIC_API_KEY
-python scripts/generate_fixtures.py
+python3 scripts/generate_fixtures.py
 ```
+
+### Where the data comes from
+
+`USE_SQL` is the top-level switch. When true, `SQL_DSN` decides which database
+and `SECURITY_CLIENT` is ignored.
+
+| Config | Backend |
+|---|---|
+| `USE_SQL=false`, `SECURITY_CLIENT=mock` | JSON fixtures (default) |
+| `USE_SQL=false`, `SECURITY_CLIENT=api` | REST adapter — **unverified** |
+| `USE_SQL=true`, `SQL_DSN=sqlite:///data/security.db` | SQLite |
+| `USE_SQL=true`, `SQL_DSN=postgresql://chatbot_ro:…@host/db` | PostgreSQL |
+| `USE_SQL=true`, `SQL_DSN=mysql://chatbot_ro:…@host/db` | MySQL |
+
+To try the SQL path against the fixtures:
+
+```bash
+python3 scripts/load_sqlite.py
+USE_SQL=true SQL_DSN=sqlite:///data/security.db streamlit run app.py
+```
+
+Map MTC's real table and column names in
+[security_client/sql_schema.py](security_client/sql_schema.py) — that is the only
+file that should need editing.
+
+> **The database account must be read-only.** `SqlSecurityClient` opens SQLite
+> with `mode=ro` and refuses anything that is not a single SELECT, but
+> application checks are the last line of defence:
+> ```sql
+> CREATE ROLE chatbot_ro LOGIN PASSWORD '...';
+> GRANT SELECT ON alarms, events, logs, devices TO chatbot_ro;
+> ```
 
 Fixture timestamps are relative to generation time. Re-run the generator if `today`
 starts returning nothing.
@@ -34,23 +70,44 @@ starts returning nothing.
 
 ```bash
 streamlit run app.py                      # SECURITY_CLIENT=mock by default
-python -m pytest                          # 243 tests, no API key needed
+python3 -m pytest                          # 526 tests, no API key needed
 ```
 
-From the terminal — faster to iterate with than the UI, and it prints the tool
-calls so you can see *why* an answer came out the way it did:
+### Trying it without an API key
+
+`OFFLINE_MODEL=true` swaps Claude for a scripted stand-in, so the whole pipeline
+runs with no credentials:
 
 ```bash
-python scripts/ask.py "Are there any critical alarms?"
-python scripts/ask.py                     # interactive, keeps context
-python scripts/ask.py --demo              # replay the PLAN.md §11 demo script
-python scripts/ask.py --dry-run "..."     # no API call, no key required
+OFFLINE_MODEL=true streamlit run app.py
+OFFLINE_MODEL=true python3 scripts/ask.py --demo
+```
+
+This demonstrates retrieval, device-name resolution, sanitization, truncation
+disclosure, refusals, and the evidence panel. **It demonstrates nothing about
+language understanding** — the routing is hand-written pattern matching, it has
+no memory between turns, and it will not generalise to a phrasing nobody
+anticipated. Every reply is labelled so it cannot be mistaken for the product.
+
+Use it to demo the app and check the plumbing. Use a real key to find out
+whether the assistant is any good.
+
+### From the terminal
+
+Faster to iterate with than the UI, and it prints the tool calls so you can see
+*why* an answer came out the way it did:
+
+```bash
+python3 scripts/ask.py "Are there any critical alarms?"
+python3 scripts/ask.py                     # interactive, keeps context
+python3 scripts/ask.py --demo              # replay the PLAN.md §11 demo script
+python3 scripts/ask.py --dry-run "..."     # no API call, no key required
 ```
 
 Live routing evaluation (costs tokens, needs a key):
 
 ```bash
-RUN_LIVE_EVAL=1 python -m pytest tests/test_evaluation.py -q
+RUN_LIVE_EVAL=1 python3 -m pytest tests/test_evaluation.py -q
 ```
 
 ## What it will not do
@@ -58,7 +115,7 @@ RUN_LIVE_EVAL=1 python -m pytest tests/test_evaluation.py -q
 Acknowledge or close alarms · change device configuration · restart systems · delete
 logs · run arbitrary commands · generate free-form database queries.
 
-These are refused at the API layer, not merely discouraged in the prompt. The five
+These are refused at the API layer, not merely discouraged in the prompt. The six
 approved read functions are the complete surface; there is no generic request helper
 that takes a method or a URL.
 
@@ -66,14 +123,21 @@ that takes a method or a URL.
 
 ```
 Streamlit  →  Controller  →  SecurityClient (Protocol)
-                  │              ├── MockSecurityClient
-                  │              └── RealSecurityApiClient
+                  │              ├── MockSecurityClient    (JSON fixtures)
+                  │              ├── SqlSecurityClient     (SQLite/Postgres/MySQL)
+                  │              └── RealSecurityApiClient (REST)
                   │
-                  └── Claude (claude-opus-5) with 5 read-only tools
+                  └── Claude (claude-opus-5) with 6 read-only tools
 ```
 
+**The model never writes SQL.** It selects one of six approved functions and
+supplies values from a fixed vocabulary; every query string is a constant and
+every model-supplied value is a bound parameter. Injection is not mitigated —
+there is no point at which a fragment could be concatenated into a statement.
+Text-to-SQL would collapse every control below.
+
 The controlling idea: **the model never reaches the security system.** It can *request*
-one of five named functions; Python decides whether that request is legal, executes it,
+one of six named functions; Python decides whether that request is legal, executes it,
 strips every field not on the allowlist, and only then shows the model any data.
 
 Four enforcement points, all in code:
@@ -110,14 +174,21 @@ chatbot/
   prompts.py                    system prompt, untrusted-data wrapper
   timeutil.py                   TimeWindow → concrete UTC range
   audit.py                      structured audit logging
+  offline_model.py              scripted stand-in for demos without a key
 security_client/
-  base.py                       SecurityClient Protocol, QueryResult
-  mock_client.py                JSON-fixture implementation
-  api_client.py                 real adapter — GET only, allowlisted paths
+  base.py                       SecurityClient Protocol, QueryResult, SummaryResult
+  taxonomy.py                   device categories + name resolution ("pc # 10" → PC-010)
   sanitization.py               field allowlists
-data/                           generated fixtures
-scripts/generate_fixtures.py    seeded, reproducible
-tests/                          schemas, mock client, security rules, controller, eval
+  mock_client.py                JSON-fixture implementation
+  sql_client.py                 SQLite / PostgreSQL / MySQL — SELECT-only, bound params
+  sql_schema.py                 table + column mapping ← edit this for MTC's database
+  api_client.py                 REST adapter — GET only, allowlisted paths (unverified)
+data/                           generated fixtures (+ security.db, gitignored)
+scripts/
+  generate_fixtures.py          seeded, reproducible
+  load_sqlite.py                fixtures → SQLite, with indexes
+  ask.py                        terminal harness: one-shot, interactive, --demo, --dry-run
+tests/                          schemas, clients, security rules, controller, audit, eval
 logs/                           audit.jsonl (gitignored)
 ```
 
@@ -125,7 +196,7 @@ logs/                           audit.jsonl (gitignored)
 
 Full checklist in [TODO.md](TODO.md). The short version:
 
-1. Add `ANTHROPIC_API_KEY` and run `python scripts/ask.py --demo`. **Nothing has ever
+1. Add `ANTHROPIC_API_KEY` and run `python3 scripts/ask.py --demo`. **Nothing has ever
    called the real Claude API** — the tool schemas and the mid-conversation system
    message are built from documentation, not from an observed response.
 2. **Write the 30 example questions** and fold them into `tests/evaluation_cases.json`.

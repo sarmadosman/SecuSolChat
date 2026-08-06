@@ -23,16 +23,36 @@ st.set_page_config(page_title="Security Assistant", page_icon="🛡️", layout=
 st.title("Security Monitoring Assistant")
 st.caption("Read-only access to alarms, events, logs, and device status.")
 
+OFFLINE = os.getenv("OFFLINE_MODEL", "").strip().casefold() in {"1", "true", "yes", "on"}
+
+if OFFLINE:
+    st.warning(
+        "**Offline mode.** Replies are assembled by a scripted stand-in, not by Claude. "
+        "This demonstrates the pipeline — retrieval, sanitization, evidence, refusals — "
+        "not language understanding. Unset `OFFLINE_MODEL` and set `ANTHROPIC_API_KEY` "
+        "for the real assistant.",
+        icon="🧪",
+    )
+
 with st.sidebar:
     st.subheader("Status")
-    mode = os.getenv("SECURITY_CLIENT", "mock")
-    st.write(f"**Data source:** `{mode}`")
-    if mode == "mock":
+    if os.getenv("USE_SQL", "").strip().casefold() in {"1", "true", "yes", "on"}:
+        source = "sql"
+        detail = os.getenv("SQL_DSN", "").split("://")[0] or "unknown"
+    else:
+        source = os.getenv("SECURITY_CLIENT", "mock")
+        detail = ""
+    st.write(f"**Data source:** `{source}`" + (f" ({detail})" if detail else ""))
+    if source == "mock":
         st.caption("Synthetic fixtures. No real security platform is being contacted.")
-    st.write(
-        "**Claude credentials:** "
-        + ("configured" if os.getenv("ANTHROPIC_API_KEY") else "not found")
-    )
+
+    if OFFLINE:
+        st.write("**Model:** `scripted stand-in` 🧪")
+    else:
+        st.write(
+            "**Claude credentials:** "
+            + ("configured" if os.getenv("ANTHROPIC_API_KEY") else "not found")
+        )
     st.divider()
     st.caption(
         "This assistant is read-only. It cannot acknowledge alarms, change device "
@@ -60,6 +80,14 @@ def render_evidence(evidence) -> None:
         payload = outcome.payload
         if outcome.is_error:
             label = f"⚠️ {outcome.action} — rejected"
+        elif "groups" in payload:
+            # Summaries count groups over records, not records.
+            shown, total = payload["groups_returned"], payload["total_groups"]
+            suffix = f"{shown} of {total}" if payload.get("truncated") else str(shown)
+            label = (
+                f"Counts · {outcome.action} ({suffix} groups, "
+                f"{payload['total_records']} records)"
+            )
         else:
             shown, total = payload.get("returned", 0), payload.get("total_matched", 0)
             suffix = f"{shown} of {total}" if payload.get("truncated") else str(shown)

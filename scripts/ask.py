@@ -5,10 +5,10 @@ Faster than the UI for iterating on prompts and routing, and it prints the tool
 calls, so you can see *why* an answer came out the way it did rather than
 inferring it.
 
-    python scripts/ask.py "Are there any critical alarms?"
-    python scripts/ask.py                 # interactive, keeps conversation context
-    python scripts/ask.py --demo          # replay the PLAN.md §11 demo script
-    python scripts/ask.py --dry-run "..."  # no API call; show what would be sent
+    python3 scripts/ask.py "Are there any critical alarms?"
+    python3 scripts/ask.py                 # interactive, keeps conversation context
+    python3 scripts/ask.py --demo          # replay the PLAN.md §11 demo script
+    python3 scripts/ask.py --dry-run "..."  # no API call; show what would be sent
 """
 
 from __future__ import annotations
@@ -32,17 +32,27 @@ DEMO_SCRIPT = [
 ]
 
 
+def describe_payload(payload: dict) -> str:
+    """Retrieval and summary payloads have different shapes. Handle both."""
+    if "groups" in payload:
+        detail = f"{payload['groups_returned']}"
+        if payload.get("truncated"):
+            detail += f" of {payload['total_groups']}"
+        return f"{detail} group(s) over {payload['total_records']} record(s)"
+    detail = f"{payload.get('returned', 0)}"
+    if payload.get("truncated"):
+        detail += f" of {payload.get('total_matched', 0)}"
+    return f"{detail} record(s)"
+
+
 def show_turn(turn) -> None:
     for outcome in turn.evidence:
         payload = outcome.payload
         if outcome.is_error:
             print(f"  ⚠ {outcome.action} rejected: {payload.get('error')}")
             continue
-        detail = f"{payload['returned']}"
-        if payload["truncated"]:
-            detail += f" of {payload['total_matched']}"
         params = {k: v for k, v in outcome.parameters.items() if v is not None}
-        print(f"  → {outcome.action}({json.dumps(params)}) — {detail} record(s)")
+        print(f"  → {outcome.action}({json.dumps(params)}) — {describe_payload(payload)}")
     print()
     print(turn.answer)
     print()

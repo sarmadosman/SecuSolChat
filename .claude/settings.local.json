@@ -15,7 +15,17 @@
       "Bash(python3 scripts/ask.py \"Are there any critical alarms?\")",
       "Bash(echo \"exit=$?\")",
       "Bash(timeout 25 python3 -m streamlit run app.py --server.headless true --server.port 8601)",
-      "Bash(curl -s -o /dev/null -w \"streamlit HTTP %{http_code}\\\\n\" http://localhost:8601)"
+      "Bash(curl -s -o /dev/null -w \"streamlit HTTP %{http_code}\\\\n\" http://localhost:8601)",
+      "Bash(python3 scripts/generate_fixtures.py)",
+      "Bash(python3 -m pytest tests/test_mock_client.py -q)",
+      "Bash(python3 scripts/ask.py --dry-run \"Is there anything wrong with the IT?\")",
+      "Bash(python3 -m pytest tests/test_sql_client.py -q)",
+      "Bash(USE_SQL=true SQL_DSN=sqlite:///data/security.db python3 -c ' *)",
+      "Bash(USE_SQL=true SQL_DSN=sqlite:///data/security.db timeout 22 python3 -m streamlit run app.py --server.headless true --server.port 8607)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:8607)",
+      "Bash(OFFLINE_MODEL=true python3 scripts/ask.py --demo)",
+      "Bash(OFFLINE_MODEL=true timeout 22 python3 -m streamlit run app.py --server.headless true --server.port 8611)",
+      "Bash(curl -s -o /dev/null -w \"offline UI HTTP %{http_code}\\\\n\" http://localhost:8611)"
     ]
   }
 }

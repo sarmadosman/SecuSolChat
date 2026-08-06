@@ -2,11 +2,22 @@
 
 Working checklist. See [PLAN.md](PLAN.md) for rationale and [README.md](README.md) for setup.
 
-**Where this stands:** 243 tests pass with no API key. The security controls, mock
-client, and controller loop are built and tested. **Nothing has ever called the real
-Claude API** — the tool schemas, `strict: true` mode, and the mid-conversation system
-message are all built from documentation, not from an observed response. That is the
-single largest unknown in the project.
+**Where this stands:** 411 tests pass with no API key. The security controls, mock
+client, and controller loop are built and tested, and MTC's three target questions all
+resolve correctly against the fixtures. **Nothing has ever called the real Claude API**
+— the tool schemas, `strict: true` mode, and the mid-conversation system message are
+all built from documentation, not from an observed response. That is the single largest
+unknown in the project.
+
+**MTC's bar for success**, and the state of each:
+
+| Question | Needs | Status |
+|---|---|---|
+| *"What are the top 10 alarms?"* | `summarize_records` | built, mock only |
+| *"What happened to pc # 10?"* | device lookup by name | built, mock only |
+| *"Is there anything wrong with the IT?"* | `category` grouping | built, mock only |
+
+All three work end-to-end against fixtures. None has been routed by a real model.
 
 Suggested order: **API key → `--demo` → fix what breaks → 30 questions → expand eval →
 platform reconciliation.** The first three are about an hour and will tell you more
@@ -16,9 +27,20 @@ about the project's real state than anything else here.
 
 ## 1. Blocked on you — nobody else can do these
 
-- [ ] Write the **30+ example questions** (PLAN.md §9 day 1). This is the spec;
-      everything downstream derives from it. Categories: active alarms · alarm details ·
-      events · logs · device status · summaries · follow-ups · unsupported.
+- [x] ~~Write the 30+ example questions~~ — done, 53 supplied and converted into
+      `tests/evaluation_cases.json` (67 cases)
+- [ ] **Confirm the device taxonomy.** Currently assumed: `it` (PC, server, network),
+      `security` (camera, access controller, sensor, door), `operations` (machine).
+      **What is a "Machine"?** The samples show both communication failures and motion
+      detection on them, which points in two directions. If Machines are cameras or IT
+      endpoints, remap `CATEGORY_OF_TYPE` in `security_client/taxonomy.py` and re-run
+      the fixture generator — nothing else depends on the choice.
+- [ ] **Confirm the area names** — currently Building A, Building B, Data Center,
+      North Entrance, Production Area, taken from the sample questions.
+- [ ] Decide whether the assistant may **suggest operator next steps**. One sample
+      answer does ("verify network connection, power state, agent status") with a
+      hedge. Currently allowed by omission; should be an explicit prompt rule either
+      way. Case `alm-003` pins the current behaviour.
 - [ ] Confirm the **target platform** — Genetec, Milestone, Nedap, a SIEM, in-house?
       Ask MTC now; this has a long lead time and blocks §4.
 - [ ] Obtain the **API documentation**: endpoints, auth, query params, response
@@ -31,7 +53,7 @@ about the project's real state than anything else here.
 ## 2. Needs an API key — the entire LLM path is unverified
 
 - [ ] Add `ANTHROPIC_API_KEY` to `.env`
-- [ ] `python scripts/ask.py --demo` — the first real call. Expect breakage.
+- [ ] `python3 scripts/ask.py --demo` — the first real call. Expect breakage.
 - [ ] Verify **`strict: true` tool schemas are accepted**. Generated from Pydantic and
       never sent to the API. Most likely thing to fail.
 - [ ] Verify the **mid-conversation `role: "system"` message** works on
@@ -48,15 +70,41 @@ about the project's real state than anything else here.
 
 ## 3. Evaluation
 
-- [ ] Expand `tests/evaluation_cases.json` from **34 → 50+** using the question list
-- [ ] Run `RUN_LIVE_EVAL=1 python -m pytest tests/test_evaluation.py`
+- [x] ~~Expand evaluation_cases.json to 50+~~ — 67 cases from MTC's samples
+- [ ] **Exercise the `followups` field.** Cases `multi-001` / `multi-002` carry
+      multi-turn follow-ups that the harness does not yet run. Needs a loop that
+      threads history between turns.
+- [ ] **`summarize_records` has no real-API implementation** — it raises
+      `NotImplementedError`. Decide between the platform's own aggregation endpoint
+      and bounded server-side paging. Do not approximate by counting one page.
+      *(Not an issue on the SQL backend, where it is a real GROUP BY.)*
+- [ ] Run `RUN_LIVE_EVAL=1 python3 -m pytest tests/test_evaluation.py`
 - [ ] Fix routing failures — change the prompt only against **measured** failures
 - [ ] Verify the **injection cases**: poisoned records must not provoke extra tool calls
       or echo `SECURITY_API_TOKEN`
 - [ ] Record a **baseline pass rate**, so later prompt edits are measurable rather than
       vibes
 
-## 4. Real API integration
+## 4a. SQL backend (if MTC's data is in a database)
+
+- [x] ~~`SqlSecurityClient`, `USE_SQL` toggle, SQLite loader, parity tests~~
+- [ ] **Confirm the platform allows direct database reads.** Some vendors treat it
+      as a support or warranty violation, and an unindexed query against a live
+      monitoring database is a real operational risk. Ask before building on it.
+- [ ] Map the real tables and columns in `security_client/sql_schema.py`
+- [ ] Create the **read-only role** and grant SELECT on only the four tables
+- [ ] Prefer **views that exclude sensitive columns**, so the account cannot select
+      what it must not show — stronger than filtering after the fact
+- [ ] Add the indexes from `scripts/load_sqlite.py` (or confirm equivalents exist).
+      Without them a broad question table-scans the log table.
+- [ ] Confirm the statement timeout applies on the target engine — it is set for
+      PostgreSQL and silently skipped elsewhere
+- [ ] Check **time zone storage**. Everything here assumes UTC; convert at the
+      boundary if the database stores local time.
+- [ ] Install the driver: `psycopg` for PostgreSQL, `pymysql` for MySQL. Neither is
+      in requirements.txt yet — add whichever applies.
+
+## 4b. Real API integration
 
 - [ ] **Reconcile `security_client/api_client.py`** against the vendor's actual docs —
       paths, parameter names, response shape. Currently written against an assumed
@@ -69,7 +117,7 @@ about the project's real state than anything else here.
       permission, not merely the client
 - [ ] Test against a **staging instance** before anything production
 - [ ] **Regenerate fixtures** to match the real schema once known
-      (`python scripts/generate_fixtures.py`)
+      (`python3 scripts/generate_fixtures.py`)
 - [ ] Exercise the **error taxonomy** for real: 401, 403, 404, timeout, malformed
       response, rate limit
 

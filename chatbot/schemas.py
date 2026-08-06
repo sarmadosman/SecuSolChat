@@ -21,6 +21,13 @@ AlarmStatus = Literal["active", "acknowledged", "resolved"]
 DeviceStatus = Literal["online", "offline", "degraded", "maintenance"]
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
 
+# Devices group two ways: by what they are, and by which team owns them.
+# "Is there anything wrong with the IT?" is a category question.
+DeviceType = Literal[
+    "pc", "server", "network", "camera", "access_controller", "sensor", "door", "machine"
+]
+DeviceCategory = Literal["it", "security", "operations"]
+
 AlarmType = Literal[
     "communication_failure",
     "tamper",
@@ -46,7 +53,7 @@ EventType = Literal[
 
 # Relative time is an enum, never a free-form date. The model has no clock; asking
 # it for ISO timestamps invites hallucinated dates. Python resolves these against
-# a real `now` in chatbot.timeutil. See PLAN.md §5.
+# a real `now` in chatbot.timeutil.
 TimeWindow = Literal[
     "last_hour",
     "last_24_hours",
@@ -56,12 +63,17 @@ TimeWindow = Literal[
     "last_30_days",
 ]
 
+GroupBy = Literal["type", "severity", "status", "area", "device", "category", "level"]
+RecordType = Literal["alarms", "events", "logs"]
+SortOrder = Literal["newest", "oldest"]
+
 ACTIONS = (
     "get_active_alarms",
     "get_alarm_details",
     "get_recent_events",
     "search_logs",
     "get_device_status",
+    "summarize_records",
 )
 
 #: The allowlist. Enforced in code, never in the prompt.
@@ -70,7 +82,11 @@ ALLOWED_ACTIONS = frozenset(ACTIONS)
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
 
-_SITE = Field(default=None, max_length=100, description="Site or location name.")
+_AREA = Field(
+    default=None,
+    max_length=100,
+    description="Area or location, e.g. 'Building A', 'Data Center', 'North Entrance'.",
+)
 _LIMIT = Field(
     default=DEFAULT_LIMIT,
     ge=1,
@@ -78,10 +94,26 @@ _LIMIT = Field(
     description=f"Max records to return (1-{MAX_LIMIT}).",
 )
 _WINDOW = Field(default=None, description="Relative time range to filter by.")
-_DEVICE_ID = Field(
+# Free text, not an ID pattern: operators say "Machine 14" or "pc # 10", never
+# "MCH-014". Resolution to a real device happens in Python, so an unrecognised
+# name comes back as "not found" or a list of candidates rather than a
+# validation error the user cannot act on.
+_DEVICE = Field(
     default=None,
-    pattern=r"^[A-Z]{2,4}-\d{1,5}$",
-    description="Device identifier, e.g. CAM-014.",
+    max_length=80,
+    description=(
+        "Device by name or ID, as the user said it — e.g. 'Machine 14', 'pc # 10', "
+        "'Server 2', 'Building A Door 3', or 'MCH-014'. Do not invent an ID."
+    ),
+)
+_DEVICE_TYPE = Field(default=None, description="Filter by kind of device.")
+_CATEGORY = Field(
+    default=None,
+    description=(
+        "Filter by the group that owns the equipment: 'it' (PCs, servers, network), "
+        "'security' (cameras, access controllers, sensors, doors), or 'operations' "
+        "(machines)."
+    ),
 )
 
 
@@ -95,8 +127,16 @@ class Params(BaseModel):
 class ActiveAlarmsParams(Params):
     severity: Severity | None = Field(default=None, description="Filter by severity.")
     status: AlarmStatus | None = Field(default=None, description="Filter by alarm status.")
-    site: str | None = _SITE
+    alarm_type: AlarmType | None = Field(default=None, description="Filter by alarm type.")
+    device: str | None = _DEVICE
+    device_type: DeviceType | None = _DEVICE_TYPE
+    category: DeviceCategory | None = _CATEGORY
+    area: str | None = _AREA
     window: TimeWindow | None = _WINDOW
+    sort: SortOrder = Field(
+        default="newest",
+        description="'oldest' answers 'which alarm has been active the longest'.",
+    )
     limit: int = _LIMIT
 
 
@@ -108,24 +148,49 @@ class AlarmDetailsParams(Params):
 
 class RecentEventsParams(Params):
     event_type: EventType | None = Field(default=None, description="Filter by event type.")
-    site: str | None = _SITE
-    device_id: str | None = _DEVICE_ID
+    device: str | None = _DEVICE
+    device_type: DeviceType | None = _DEVICE_TYPE
+    category: DeviceCategory | None = _CATEGORY
+    area: str | None = _AREA
     window: TimeWindow | None = _WINDOW
     limit: int = _LIMIT
 
 
 class SearchLogsParams(Params):
-    device_id: str | None = _DEVICE_ID
+    device: str | None = _DEVICE
+    device_type: DeviceType | None = _DEVICE_TYPE
+    category: DeviceCategory | None = _CATEGORY
     level: LogLevel | None = Field(default=None, description="Minimum log level.")
     window: TimeWindow | None = _WINDOW
     limit: int = _LIMIT
 
 
 class DeviceStatusParams(Params):
-    device_id: str | None = _DEVICE_ID
+    device: str | None = _DEVICE
+    device_type: DeviceType | None = _DEVICE_TYPE
+    category: DeviceCategory | None = _CATEGORY
     status: DeviceStatus | None = Field(default=None, description="Filter by device state.")
-    site: str | None = _SITE
+    area: str | None = _AREA
     limit: int = _LIMIT
+
+
+class SummarizeParams(Params):
+    """Counts over the *whole* matching set, not over a truncated page.
+
+    This exists so the assistant never has to do arithmetic on a capped list and
+    then state a confident total — the failure mode behind "what are the top 10
+    alarms?" answered from the 20 records that happened to come back.
+    """
+
+    record_type: RecordType = Field(description="Which collection to count.")
+    group_by: GroupBy = Field(description="Field to group and rank by.")
+    severity: Severity | None = Field(default=None, description="Filter by severity.")
+    status: AlarmStatus | None = Field(default=None, description="Alarms only.")
+    category: DeviceCategory | None = _CATEGORY
+    device_type: DeviceType | None = _DEVICE_TYPE
+    area: str | None = _AREA
+    window: TimeWindow | None = _WINDOW
+    limit: int = Field(default=10, ge=1, le=50, description="How many groups to return.")
 
 
 # --- Discriminated union ------------------------------------------------------
@@ -161,8 +226,19 @@ class GetDeviceStatus(BaseModel):
     parameters: DeviceStatusParams = Field(default_factory=DeviceStatusParams)
 
 
+class SummarizeRecords(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["summarize_records"]
+    parameters: SummarizeParams
+
+
 ToolRequest = Annotated[
-    GetActiveAlarms | GetAlarmDetails | GetRecentEvents | SearchLogs | GetDeviceStatus,
+    GetActiveAlarms
+    | GetAlarmDetails
+    | GetRecentEvents
+    | SearchLogs
+    | GetDeviceStatus
+    | SummarizeRecords,
     Field(discriminator="action"),
 ]
 
@@ -174,6 +250,7 @@ _PARAM_MODELS: dict[str, type[Params]] = {
     "get_recent_events": RecentEventsParams,
     "search_logs": SearchLogsParams,
     "get_device_status": DeviceStatusParams,
+    "summarize_records": SummarizeParams,
 }
 
 _DESCRIPTIONS: dict[str, str] = {
@@ -197,8 +274,18 @@ _DESCRIPTIONS: dict[str, str] = {
     ),
     "get_device_status": (
         "Retrieve device and system health: online, offline, degraded, or in maintenance. "
-        "Use for questions about whether equipment is reachable or healthy, including "
-        "'which cameras are offline'. Read-only."
+        "Use for questions about whether equipment is reachable or healthy — 'which "
+        "cameras are offline', 'are any servers down', 'what happened to pc 10'. Pass the "
+        "device name exactly as the user said it. Use `category` for questions about a "
+        "whole group, such as 'is there anything wrong with the IT?'. Read-only."
+    ),
+    "summarize_records": (
+        "Count and rank records by a field, across the whole matching set rather than a "
+        "single page. Use whenever the question asks how many, which is most, top N, "
+        "busiest, or a comparison between groups — 'what are the top 10 alarms', 'which "
+        "area has the most alarms', 'how many alarms were resolved today'. Prefer this "
+        "over counting records yourself: a retrieval call returns a capped page, so "
+        "counting its records would understate the true total. Read-only."
     ),
 }
 

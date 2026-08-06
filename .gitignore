@@ -6,3 +6,5 @@ venv/
 .pytest_cache/
 logs/*.jsonl
 .DS_Store
+data/security.db
+*.db

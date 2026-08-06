@@ -22,11 +22,17 @@ from pydantic import ValidationError
 from chatbot import audit, prompts
 from chatbot.schemas import parse_tool_request, tool_definitions
 from chatbot.timeutil import resolve_window, utc_now
-from security_client.base import QueryResult, SecurityClient
+from security_client.base import (
+    AmbiguousDevice,
+    DeviceNotFound,
+    QueryResult,
+    SecurityClient,
+    SummaryResult,
+)
 from security_client.sanitization import sanitize_records
 
 MODEL = "claude-opus-5"
-MAX_TOKENS = 16_000
+MAX_TOKENS = 16000
 #: Bounds a single user turn. Caps runaway loops and limits the blast radius of
 #: anything injected via record content to a handful of logged reads.
 MAX_TOOL_CALLS_PER_TURN = 4
@@ -40,7 +46,8 @@ class ConfigurationError(RuntimeError):
     """
 
 
-#: Which field allowlist applies to each action's records.
+#: Which field allowlist applies to each action's records. `summarize_records`
+#: returns counts rather than records, so it has no allowlist entry.
 RECORD_KIND: dict[str, str] = {
     "get_active_alarms": "alarm",
     "get_alarm_details": "alarm",
@@ -48,6 +55,8 @@ RECORD_KIND: dict[str, str] = {
     "search_logs": "log",
     "get_device_status": "device",
 }
+
+_SUMMARY_KIND = {"alarms": "alarm", "events": "event", "logs": "log"}
 
 
 @dataclass
@@ -106,7 +115,6 @@ def execute_tool_request(
     params = request.parameters.model_dump()
     window = params.pop("window", None)
     since, until = resolve_window(window)
-    kind = RECORD_KIND[request.action]
 
     try:
         if request.action == "get_alarm_details":
@@ -118,8 +126,31 @@ def execute_tool_request(
             result = client.get_recent_events(since=since, until=until, **params)
         elif request.action == "search_logs":
             result = client.search_logs(since=since, until=until, **params)
+        elif request.action == "summarize_records":
+            result = client.summarize_records(since=since, until=until, **params)
         else:  # get_device_status — no time filter; device state is current, not historical
             result = client.get_device_status(**params)
+    except (DeviceNotFound, AmbiguousDevice) as exc:
+        # Not an error to hide: the model should relay it and ask, so give it the
+        # candidate names rather than a bare failure.
+        payload: dict[str, Any] = {"error": str(exc)}
+        if isinstance(exc, AmbiguousDevice):
+            payload["candidates"] = [
+                {"id": d["id"], "name": d.get("name")} for d in exc.candidates[:10]
+            ]
+        audit.log_tool_call(
+            action=request.action,
+            parameters=params,
+            result_count=0,
+            total_matched=0,
+            truncated=False,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            status="not_found",
+            error=str(exc),
+        )
+        return ToolOutcome(
+            action=request.action, parameters=params, payload=payload, is_error=True
+        )
     except Exception as exc:  # noqa: BLE001 - surface a generic failure, log the detail
         audit.log_tool_call(
             action=request.action,
@@ -139,34 +170,72 @@ def execute_tool_request(
         )
 
     payload = result.to_tool_payload()
-    payload["records"] = sanitize_records(payload["records"], kind)
+    if "records" in payload:
+        payload["records"] = sanitize_records(payload["records"], RECORD_KIND[request.action])
     if window:
         payload["window"] = window
 
+    # `window` was consumed into since/until, but it must still show up in the
+    # evidence and the audit trail — otherwise there is no way to confirm that
+    # "today" was actually applied.
+    display_params = {**params, "window": window} if window else params
+
+    is_summary = isinstance(result, SummaryResult)
     audit.log_tool_call(
         action=request.action,
-        parameters={**params, "window": window} if window else params,
-        result_count=len(result.records),
-        total_matched=result.total_matched,
-        truncated=result.truncated,
+        parameters=display_params,
+        result_count=len(result.groups) if is_summary else len(result.records),
+        total_matched=result.total_records if is_summary else result.total_matched,
+        truncated=payload.get("truncated", False),
         duration_ms=int((time.perf_counter() - started) * 1000),
         status="success",
     )
-    return ToolOutcome(action=request.action, parameters=params, payload=payload)
+    return ToolOutcome(action=request.action, parameters=display_params, payload=payload)
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSEY = {"0", "false", "no", "off", ""}
+
+
+def _is_true(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().casefold()
+    if value in _TRUTHY:
+        return True
+    if value in _FALSEY:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean (true/false), got {raw!r}."
+    )
 
 
 def build_client() -> SecurityClient:
-    """Pick an implementation from the environment. The controller never knows which."""
+    """Pick an implementation from the environment. The controller never knows which.
+
+    USE_SQL is the top-level switch: when true, the security data lives in a
+    database and SQL_DSN says where. Otherwise SECURITY_CLIENT chooses between
+    the fixtures and the REST adapter.
+    """
+    if _is_true("USE_SQL"):
+        from security_client.sql_client import SqlSecurityClient
+
+        return SqlSecurityClient()
+
     choice = os.getenv("SECURITY_CLIENT", "mock").strip().lower()
     if choice == "mock":
         from security_client.mock_client import MockSecurityClient
 
         return MockSecurityClient()
-    if choice == "real":
+    if choice in {"real", "api"}:
         from security_client.api_client import RealSecurityApiClient
 
         return RealSecurityApiClient()
-    raise ValueError(f"SECURITY_CLIENT must be 'mock' or 'real', got {choice!r}")
+    raise ValueError(
+        f"SECURITY_CLIENT must be 'mock' or 'api', got {choice!r}. "
+        f"For a database, set USE_SQL=true instead."
+    )
 
 
 class Controller:
@@ -176,11 +245,20 @@ class Controller:
         *,
         model: str = MODEL,
         max_tool_calls: int = MAX_TOOL_CALLS_PER_TURN,
+        offline: bool | None = None,
     ) -> None:
         import anthropic  # lazy: keeps execute_tool_request testable without the SDK
 
         self.anthropic = anthropic
-        self.llm = anthropic.Anthropic()
+        self.offline = _is_true("OFFLINE_MODEL") if offline is None else offline
+        if self.offline:
+            # Scripted stand-in so the app runs with no API key. Proves the
+            # plumbing, not language understanding — see chatbot/offline_model.py.
+            from chatbot.offline_model import ScriptedModel
+
+            self.llm = ScriptedModel()
+        else:
+            self.llm = anthropic.Anthropic()
         self.client = client or build_client()
         self.model = model
         self.max_tool_calls = max_tool_calls

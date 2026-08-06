@@ -87,13 +87,15 @@ class TestExecuteToolRequest:
         assert set(outcome.payload) >= {"records", "returned", "total_matched", "truncated"}
         assert outcome.payload["returned"] == len(outcome.payload["records"])
 
-    def test_window_is_resolved_and_echoed(self, client) -> None:
+    def test_window_is_resolved_and_stays_visible(self, client) -> None:
         outcome = execute_tool_request(
             client, "search_logs", {"window": "last_hour", "limit": 5}
         )
         assert outcome.payload["window"] == "last_hour"
-        # `window` is consumed into since/until, never forwarded to the client.
-        assert "window" not in outcome.parameters
+        # It is consumed into since/until before reaching the client, but must
+        # remain in the reported parameters — otherwise neither the evidence
+        # panel nor the audit log can show that a time filter was applied.
+        assert outcome.parameters["window"] == "last_hour"
 
     def test_missing_alarm_reports_nothing_found(self, client) -> None:
         outcome = execute_tool_request(client, "get_alarm_details", {"alarm_id": "ALM-999999"})
@@ -195,7 +197,7 @@ class TestRequestConstruction:
         request = controller.llm.requests[0]
         assert request["system"][0]["cache_control"] == {"type": "ephemeral"}
         assert request["system"][0]["text"] == prompts.SYSTEM_PROMPT
-        assert len(request["tools"]) == 5
+        assert len(request["tools"]) == len(tool_definitions())
 
     def test_thinking_is_not_disabled(self) -> None:
         """Disabling thinking on Opus 5 can turn tool calls into plain text."""

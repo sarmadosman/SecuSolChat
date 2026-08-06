@@ -8,7 +8,7 @@ Two layers:
 * Routing checks call the live model and are skipped unless ANTHROPIC_API_KEY is
   set and RUN_LIVE_EVAL=1. Run them deliberately:
 
-      RUN_LIVE_EVAL=1 python -m pytest tests/test_evaluation.py -q
+      RUN_LIVE_EVAL=1 python3 -m pytest tests/test_evaluation.py -q
 """
 
 from __future__ import annotations
@@ -32,8 +32,19 @@ CATEGORIES = {
     "injection_record",
     "bad_identifier",
     "volume",
+    "aggregation",
+    "device_lookup",
+    "multi_call",
 }
 TARGET_CASE_COUNT = 50
+
+
+def expected_actions(case: dict[str, Any]) -> list[str]:
+    """A case may name one required action, or several acceptable ones."""
+    if case.get("expect_actions"):
+        return list(case["expect_actions"])
+    action = case.get("expect_action")
+    return [action] if action else []
 
 CASES: list[dict[str, Any]] = json.loads(CASES_PATH.read_text())["cases"]
 
@@ -58,26 +69,44 @@ class TestCaseFile:
         assert case["category"] in CATEGORIES
 
     @pytest.mark.parametrize("case", CASES, ids=case_id)
-    def test_expected_action_is_on_the_allowlist(self, case: dict[str, Any]) -> None:
-        expected = case.get("expect_action")
-        assert expected is None or expected in ALLOWED_ACTIONS
+    def test_expected_actions_are_on_the_allowlist(self, case: dict[str, Any]) -> None:
+        for action in expected_actions(case):
+            assert action in ALLOWED_ACTIONS
 
     @pytest.mark.parametrize("case", CASES, ids=case_id)
     def test_expected_params_are_actually_expressible(self, case: dict[str, Any]) -> None:
-        """A case asserting an impossible parameter would never pass. Catch it here."""
-        action, params = case.get("expect_action"), case.get("expect_params")
-        if not action or not params:
+        """A case asserting an impossible parameter would never pass. Catch it here.
+
+        With `expect_actions`, the parameters need only be valid for at least one
+        of the acceptable actions — `area` means something to alarms and events
+        but not to a log search.
+        """
+        params = case.get("expect_params")
+        actions = expected_actions(case)
+        if not actions or not params:
             return
-        try:
-            parse_tool_request(action, params)
-        except ValidationError as exc:
-            pytest.fail(f"{case['id']} expects parameters the schema rejects: {exc}")
+
+        errors = []
+        for action in actions:
+            try:
+                parse_tool_request(action, params)
+                return
+            except ValidationError as exc:
+                errors.append(f"{action}: {exc.errors()[0]['msg']}")
+        pytest.fail(f"{case['id']} expects parameters no candidate action accepts: {errors}")
 
     @pytest.mark.parametrize("case", CASES, ids=case_id)
     def test_unsupported_cases_expect_no_tool_call(self, case: dict[str, Any]) -> None:
         if case["category"] == "unsupported":
-            assert case.get("expect_action") is None
+            assert not expected_actions(case)
             assert case.get("expect_refusal") is True
+
+    def test_the_three_target_questions_are_covered(self) -> None:
+        """MTC named these as the bar for success. They must never be dropped."""
+        questions = " ".join(c["question"].casefold() for c in CASES)
+        assert "top 10 alarms" in questions
+        assert "pc # 10" in questions
+        assert "wrong with the it" in questions
 
     def test_case_count_progress(self) -> None:
         """Not a failure yet — a visible reminder that the set is still a seed."""
@@ -108,18 +137,21 @@ def controller():
 def test_routing(controller, case: dict[str, Any]) -> None:
     turn, _ = controller.process_message(case["question"])
     actions = [outcome.action for outcome in turn.evidence]
-    expected = case.get("expect_action")
+    acceptable = expected_actions(case)
 
-    if expected is None:
+    if not acceptable:
         assert not actions, f"expected no tool call, got {actions}"
     else:
-        assert expected in actions, f"expected {expected}, got {actions or 'no call'}"
+        hit = next((a for a in acceptable if a in actions), None)
+        assert hit, f"expected one of {acceptable}, got {actions or 'no call'}"
         for outcome in turn.evidence:
-            if outcome.action != expected:
+            if outcome.action != hit:
                 continue
             for key, value in (case.get("expect_params") or {}).items():
-                assert outcome.parameters.get(key) == value, (
-                    f"{key}: expected {value!r}, got {outcome.parameters.get(key)!r}"
+                if key not in outcome.parameters:
+                    continue  # parameter not applicable to the action that ran
+                assert outcome.parameters[key] == value, (
+                    f"{key}: expected {value!r}, got {outcome.parameters[key]!r}"
                 )
             break
 

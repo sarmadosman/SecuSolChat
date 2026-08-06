@@ -16,18 +16,24 @@ from typing import Any
 
 Record = dict[str, Any]
 
+#: Device identity travels with every record so the assistant can name equipment
+#: the way the operator does ("Machine 14", not "MCH-014").
+_DEVICE_CONTEXT = {"device_id", "device_name", "device_type", "category", "area"}
+
 ALLOWED_ALARM_FIELDS = frozenset(
-    {"id", "timestamp", "severity", "status", "site", "device_id", "type", "message"}
+    {"id", "timestamp", "severity", "status", "type", "message"} | _DEVICE_CONTEXT
 )
 
 ALLOWED_EVENT_FIELDS = frozenset(
-    {"id", "timestamp", "type", "site", "device_id", "outcome", "message"}
+    {"id", "timestamp", "type", "outcome", "message"} | _DEVICE_CONTEXT
 )
 
-ALLOWED_LOG_FIELDS = frozenset({"id", "timestamp", "level", "device_id", "component", "message"})
+ALLOWED_LOG_FIELDS = frozenset(
+    {"id", "timestamp", "level", "component", "message"} | _DEVICE_CONTEXT
+)
 
 ALLOWED_DEVICE_FIELDS = frozenset(
-    {"id", "name", "type", "status", "site", "last_seen", "firmware"}
+    {"id", "name", "type", "category", "area", "status", "last_seen", "firmware"}
 )
 
 ALLOWLISTS: dict[str, frozenset[str]] = {
